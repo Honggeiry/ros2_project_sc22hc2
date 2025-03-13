@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'lab5'
+package_name = 'ros2_project_sc22hc2'
 
 setup(
     name=package_name,
@@ -20,10 +20,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'first_step = lab5.first_step:main',
-            'second_step = lab5.second_step:main',
-            'third_step = lab5.third_step:main',
-            'fourth_step = lab5.fourth_step:main',
+            'task = ros2_project_sc22hc2.task:main',
+            #'second_step = lab5.second_step:main',
+            #'third_step = lab5.third_step:main',
+            #'fourth_step = lab5.fourth_step:main',
         ],
     },
 )
