@@ -21,9 +21,6 @@ setup(
     entry_points={
         'console_scripts': [
             'task = ros2_project_sc22hc2.task:main',
-            #'second_step = lab5.second_step:main',
-            #'third_step = lab5.third_step:main',
-            #'fourth_step = lab5.fourth_step:main',
         ],
     },
 )
