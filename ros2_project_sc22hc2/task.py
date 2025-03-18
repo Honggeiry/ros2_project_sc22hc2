@@ -5,11 +5,52 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.exceptions import ROSInterruptException
 import signal
+
+class GoToPose(Node):
+    def __init__(self):
+        super().__init__('navigation_goal_action_client')
+        self.action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+    def send_goal(self, x, y, yaw):
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+
+        # Position
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+
+        # Orientation
+        goal_msg.pose.pose.orientation.z = np.sin(yaw / 2)
+        goal_msg.pose.pose.orientation.w = np.cos(yaw / 2)
+
+        self.action_client.wait_for_server()
+        self.send_goal_future = self.action_client.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
+        self.send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('Goal rejected')
+            return
+
+        self.get_logger().info('Goal accepted')
+        self.get_result_future = goal_handle.get_result_async()
+        self.get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info(f'Navigation result: {result}')
+
+    def feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
 
 class Robot(Node):
     def __init__(self):
@@ -27,6 +68,14 @@ class Robot(Node):
         self.subscription = self.create_subscription(Image, '/camera/image_raw', self.callback, 10)
         self.subscription  # prevent unused variable warning
 
+        self.goal_points = [
+            (-3.86, 3.57, 0.00247),
+            (-3.01, -3.87, -0.00143),
+            (-4.55, -8.19, 0.00247)
+        ]
+        self.current_goal_index = 0
+        self.navigation_client = GoToPose()
+
     def callback(self, data):
         try:
             image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
@@ -40,7 +89,7 @@ class Robot(Node):
         lower_blue = np.array([110 - self.sensitivity, 100, 100])
         upper_blue = np.array([130 + self.sensitivity, 255, 255])
 
-        # Threshold the HSV image to get only blue colors
+        # Threshold the HSV image to get only blue colours
         mask = cv2.inRange(hsv_image, lower_blue, upper_blue)
 
         # Find contours in the mask
@@ -48,16 +97,16 @@ class Robot(Node):
 
         if len(contours) > 0:
             c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(c) > 500:  # Adjust this threshold as needed
+            if cv2.contourArea(c) > 500:
                 self.blue_flag = True
                 M = cv2.moments(c)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    if cv2.contourArea(c) > 10000:  # Adjust this threshold as needed
+                    if cv2.contourArea(c) > 10000:
                         self.move_backward_flag = True
                         self.move_forward_flag = False
-                    elif cv2.contourArea(c) < 5000:  # Adjust this threshold as needed
+                    elif cv2.contourArea(c) < 5000:
                         self.move_forward_flag = True
                         self.move_backward_flag = False
                     else:
@@ -91,6 +140,14 @@ class Robot(Node):
             twist.linear.x = 0.0  # Stop
         self.publisher.publish(twist)
 
+    def navigate_to_next_goal(self):
+        if self.current_goal_index < len(self.goal_points):
+            goal = self.goal_points[self.current_goal_index]
+            self.navigation_client.send_goal(goal[0], goal[1], goal[2])
+            self.current_goal_index += 1
+        else:
+            self.get_logger().info("All goals reached.")
+
 def main():
     def signal_handler(sig, frame):
         robot.stop()
@@ -105,10 +162,14 @@ def main():
 
     try:
         while rclpy.ok():
-            if robot.blue_flag:
-                robot.move_towards_blue()
+            if robot.current_goal_index < len(robot.goal_points):
+                robot.navigate_to_next_goal()
+                time.sleep(1)  # Wait for the robot to reach the goal
             else:
-                robot.search_for_blue()
+                if robot.blue_flag:
+                    robot.move_towards_blue()
+                else:
+                    robot.search_for_blue()
             time.sleep(0.1)
     except ROSInterruptException:
         pass
