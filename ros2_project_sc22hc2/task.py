@@ -1,6 +1,6 @@
 from __future__ import division
 import threading
-import sys, time
+import sys, time, signal
 import cv2
 import numpy as np
 import rclpy
@@ -11,170 +11,206 @@ from rclpy.action import ActionClient
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.exceptions import ROSInterruptException
-import signal
 
 class GoToPose(Node):
     def __init__(self):
         super().__init__('navigation_goal_action_client')
         self.action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.goal_handle = None
+        self.goal_completed = False
 
     def send_goal(self, x, y, yaw):
+        self.goal_completed = False
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = 'map'
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
 
-        # Position
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
-
-        # Orientation
+        # Convert yaw to quaternion (assuming roll=pitch=0)
         goal_msg.pose.pose.orientation.z = np.sin(yaw / 2)
         goal_msg.pose.pose.orientation.w = np.cos(yaw / 2)
 
+        self.get_logger().info(f"Sending goal: x={x}, y={y}, yaw={yaw}")
         self.action_client.wait_for_server()
-        self.send_goal_future = self.action_client.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
+        self.send_goal_future = self.action_client.send_goal_async(goal_msg)
         self.send_goal_future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
+        self.goal_handle = future.result()
+        if not self.goal_handle.accepted:
             self.get_logger().info('Goal rejected')
             return
-
-        self.get_logger().info('Goal accepted')
-        self.get_result_future = goal_handle.get_result_async()
+        self.get_logger().info("Goal accepted")
+        self.get_result_future = self.goal_handle.get_result_async()
         self.get_result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        result = future.result().result
-        self.get_logger().info(f'Navigation result: {result}')
+        self.goal_completed = True
+        self.get_logger().info('Goal completed')
 
-    def feedback_callback(self, feedback_msg):
-        feedback = feedback_msg.feedback
+    def cancel_goal(self):
+        if self.goal_handle:
+            future = self.goal_handle.cancel_goal_async()
+            self.get_logger().info('Canceling current goal')
 
 class Robot(Node):
     def __init__(self):
         super().__init__('robot')
-        
         self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.blue_flag = False
+        self.blue_detected = False
         self.sensitivity = 10
-        self.move_forward_flag = False
-        self.move_backward_flag = False
-        self.stop_flag = False
-        self.search_flag = True  # Flag to indicate if the robot is searching for the blue box
+        self.move_forward = False
+        self.move_backward = False
+        self.stop_moving = False
 
         self.bridge = CvBridge()
-        self.subscription = self.create_subscription(Image, '/camera/image_raw', self.callback, 10)
-        self.subscription  # prevent unused variable warning
-
-        self.goal_points = [
-            (-3.86, 3.57, 0.00247),
-            (-3.01, -3.87, -0.00143),
-            (-4.55, -8.19, 0.00247)
+        self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        
+        # Waypoints list: (x, y, yaw)
+        self.waypoints = [
+            (-2.97, -3.9, -0.00134),
+            (4.18, -5.49, -0.00134)
         ]
-        self.current_goal_index = 0
-        self.navigation_client = GoToPose()
+        self.current_waypoint = 0
+        # Create the navigator node
+        self.navigator = GoToPose()
 
-    def callback(self, data):
+    def image_callback(self, data):
         try:
-            image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+            frame = self.bridge.imgmsg_to_cv2(data, 'bgr8')
         except CvBridgeError as e:
-            self.get_logger().error(f"Could not convert image: {e}")
+            self.get_logger().error(f"Image conversion failed: {e}")
             return
 
-        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        # Convert frame to HSV
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Blue color detection thresholds
+        lower_blue = np.array([100, 150, 50])
+        upper_blue = np.array([140, 255, 255])
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        
+        # Find contours of the blue regions
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Reset flags each callback
+        self.blue_detected = False
+        self.move_forward = False
+        self.move_backward = False
+        self.stop_moving = False
 
-        # Define range for blue color in HSV
-        lower_blue = np.array([110 - self.sensitivity, 100, 100])
-        upper_blue = np.array([130 + self.sensitivity, 255, 255])
-
-        # Threshold the HSV image to get only blue colours
-        mask = cv2.inRange(hsv_image, lower_blue, upper_blue)
-
-        # Find contours in the mask
-        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-        if len(contours) > 0:
-            c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(c) > 500:
-                self.blue_flag = True
-                M = cv2.moments(c)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > 500:
+                self.blue_detected = True
+                M = cv2.moments(largest)
                 if M["m00"] != 0:
+                    # You can use the centroid (cx) if needed for further control
                     cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    if cv2.contourArea(c) > 10000:
-                        self.move_backward_flag = True
-                        self.move_forward_flag = False
-                    elif cv2.contourArea(c) < 5000:
-                        self.move_forward_flag = True
-                        self.move_backward_flag = False
-                    else:
-                        self.stop_flag = True
-                        self.move_forward_flag = False
-                        self.move_backward_flag = False
-            else:
-                self.blue_flag = False
-        else:
-            self.blue_flag = False
-            self.move_forward_flag = False
-            self.move_backward_flag = False
-            self.stop_flag = False
+                    area = cv2.contourArea(largest)
+                    # Decide motion based on the area of the blue object
+                    if area > 15000:  # Too close
+                        self.move_backward = True
+                    elif area < 8000:  # Too far
+                        self.move_forward = True
+                    else:  # Within desired range
+                        self.stop_moving = True
 
-        # Show the camera feed
-        cv2.imshow('Camera Feed', image)
-        cv2.waitKey(3)
+        cv2.imshow('Camera View', frame)
+        cv2.waitKey(1)
 
-    def search_for_blue(self):
-        twist = Twist()
-        twist.angular.z = 0.5  # Rotate the robot to search for the blue box
-        self.publisher.publish(twist)
+    def approach_blue(self):
+        cmd = Twist()
+        if self.move_forward:
+            cmd.linear.x = 0.25
+            self.get_logger().info("Moving forward")
+        elif self.move_backward:
+            cmd.linear.x = -0.25
+            self.get_logger().info("Moving backward")
+        elif self.stop_moving:
+            cmd.linear.x = 0.0
+            self.get_logger().info("Stopping")
+        self.publisher.publish(cmd)
 
-    def move_towards_blue(self):
-        twist = Twist()
-        if self.move_forward_flag:
-            twist.linear.x = 0.2  # Move forward
-        elif self.move_backward_flag:
-            twist.linear.x = -0.2  # Move backward
-        elif self.stop_flag:
-            twist.linear.x = 0.0  # Stop
-        self.publisher.publish(twist)
-
-    def navigate_to_next_goal(self):
-        if self.current_goal_index < len(self.goal_points):
-            goal = self.goal_points[self.current_goal_index]
-            self.navigation_client.send_goal(goal[0], goal[1], goal[2])
-            self.current_goal_index += 1
-        else:
-            self.get_logger().info("All goals reached.")
+    def search_blue(self):
+        cmd = Twist()
+        cmd.angular.z = 0.4
+        self.get_logger().info("Searching for blue")
+        self.publisher.publish(cmd)
 
 def main():
-    def signal_handler(sig, frame):
-        robot.stop()
-        rclpy.shutdown()
-
-    rclpy.init(args=None)
+    rclpy.init()
+    # Create our nodes
     robot = Robot()
+    navigator = robot.navigator  # Access the navigator node
 
+    # Create a MultiThreadedExecutor and add both nodes so that all callbacks are handled
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(robot)
+    executor.add_node(navigator)
+
+    # Define a signal handler for a graceful shutdown
+    def signal_handler(sig, frame):
+        robot.get_logger().info("Shutting down")
+        rclpy.shutdown()
     signal.signal(signal.SIGINT, signal_handler)
-    thread = threading.Thread(target=rclpy.spin, args=(robot,), daemon=True)
-    thread.start()
+
+    # Start the executor in a separate thread
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
 
     try:
-        while rclpy.ok():
-            if robot.current_goal_index < len(robot.goal_points):
-                robot.navigate_to_next_goal()
-                time.sleep(1)  # Wait for the robot to reach the goal
+        # Phase 1: Navigate through waypoints until a blue object is detected
+        while robot.current_waypoint < len(robot.waypoints) and rclpy.ok():
+            x, y, yaw = robot.waypoints[robot.current_waypoint]
+            robot.get_logger().info(f"Navigating to waypoint {robot.current_waypoint}: x={x}, y={y}, yaw={yaw}")
+            navigator.send_goal(x, y, yaw)
+            
+            # Wait until either the navigation goal is completed or blue is detected.
+            while not navigator.goal_completed and not robot.blue_detected and rclpy.ok():
+                time.sleep(0.1)
+            
+            if robot.blue_detected:
+                navigator.cancel_goal()
+                robot.get_logger().info("Blue detected - interrupting navigation")
+                break
             else:
-                if robot.blue_flag:
-                    robot.move_towards_blue()
-                else:
-                    robot.search_for_blue()
-            time.sleep(0.1)
-    except ROSInterruptException:
-        pass
+                robot.current_waypoint += 1
 
-    cv2.destroyAllWindows()
+        # Phase 2: Handle blue box detection
+        if robot.blue_detected:
+            robot.get_logger().info("Approaching blue box")
+            # Continue approaching until the blue box is within the desired range (stop_moving flag set)
+            while not robot.stop_moving and rclpy.ok():
+                robot.approach_blue()
+                time.sleep(0.1)
+        else:
+            robot.get_logger().info("Searching for blue box")
+            # If no blue was detected during waypoint navigation, search for it
+            while not robot.blue_detected and rclpy.ok():
+                robot.search_blue()
+                time.sleep(0.1)
+            
+            if robot.blue_detected:
+                robot.get_logger().info("Blue found - approaching")
+                while not robot.stop_moving and rclpy.ok():
+                    robot.approach_blue()
+                    time.sleep(0.1)
+
+        # Final stop command
+        robot.publisher.publish(Twist())
+        robot.get_logger().info("Mission complete")
+
+    except Exception as e:
+        robot.get_logger().error(f"Error: {str(e)}")
+    finally:
+        cv2.destroyAllWindows()
+        # Shutdown the executor and nodes
+        executor.shutdown()
+        robot.destroy_node()
+        navigator.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
