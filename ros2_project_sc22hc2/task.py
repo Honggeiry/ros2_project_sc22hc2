@@ -1,16 +1,17 @@
 from __future__ import division
 import threading
-import sys, time, signal
+import sys
+import time
+import signal
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge, CvBridgeError
-from rclpy.exceptions import ROSInterruptException
+from sensor_msgs.msg import Image, LaserScan
+from cv_bridge import CvBridge
 
 class GoToPose(Node):
     def __init__(self):
@@ -26,7 +27,6 @@ class GoToPose(Node):
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
-
         goal_msg.pose.pose.orientation.z = np.sin(yaw / 2)
         goal_msg.pose.pose.orientation.w = np.cos(yaw / 2)
 
@@ -60,150 +60,154 @@ class Robot(Node):
 
         self.bridge = CvBridge()
         self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        self.subscription_scan = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         
-        # Waypoints list: (x, y, yaw)
-        self.waypoints = [
-            (-2.97, -3.9, -0.00134),
-            (4.18, -5.49, -0.00134),
-            (1.71, -10.1, -0.00134)
-        ]
+        self.waypoints = [(-6.17, -4.06, -0.00134)]
         self.current_waypoint = 0
-        # Create the navigator node
         self.navigator = GoToPose()
 
-        # For smoothing blue area detection
-        self.area_buffer = []
-        self.buffer_size = 5
-        self.avg_area = 0
-
-        # New variables for centroid tracking
+        # Centroid tracking
         self.cx = None
-        self.cy = None
         self.frame_width = None
-        self.frame_height = None
 
-        # Parameters for approach control:
-        # target_area corresponds to the blue box's apparent area when the robot is ~1 m away.
-        # Increase this value if the robot stops too early.
-        self.target_area = 200000    # Increased target area so that the robot drives closer
-        self.tolerance = 5000        # Acceptable range around the target area
-        self.Kp = 0.00001            # Proportional gain for forward velocity
+        # LiDAR parameters
+        self.current_distance = float('inf')
+        self.target_distance = 1.0
+        self.distance_tolerance = 0.1
+        self.Kp_linear = 0.3
+        self.max_linear_speed = 0.2
+        self.min_safe_distance = 0.8
+        self.lidar_initialized = False
 
-        # Parameters for centering control
-        self.center_threshold = 20   # pixel error tolerated for centering
-        self.Kp_angle = 0.005        # Proportional gain for angular velocity
+        # Centering parameters
+        self.center_threshold = 20
+        self.Kp_angle = 0.005
 
     def image_callback(self, data):
         try:
             frame = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-        except CvBridgeError as e:
-            self.get_logger().error(f"Image conversion failed: {e}")
+        except Exception as e:
+            self.get_logger().error(f"Image error: {str(e)}")
             return
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Blue color detection thresholds (adjust if needed)
         lower_blue = np.array([100, 150, 50])
         upper_blue = np.array([140, 255, 255])
         mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        
-        # Find contours of blue regions
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Update frame dimensions
-        self.frame_height, self.frame_width = frame.shape[:2]
-        
-        # Reset blue detection and centroid variables
+        self.frame_width = frame.shape[1]
         self.blue_detected = False
         self.cx = None
-        self.cy = None
 
         if contours:
             largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            if area > 500:
+            if cv2.contourArea(largest) > 500:
                 self.blue_detected = True
                 M = cv2.moments(largest)
                 if M["m00"] != 0:
                     self.cx = int(M["m10"] / M["m00"])
-                    self.cy = int(M["m01"] / M["m00"])
-                # Update the buffer and compute the running average area
-                self.area_buffer.append(area)
-                if len(self.area_buffer) > self.buffer_size:
-                    self.area_buffer.pop(0)
-                self.avg_area = sum(self.area_buffer) / len(self.area_buffer)
-        else:
-            self.area_buffer = []
-            self.avg_area = 0
 
         cv2.imshow('Camera View', frame)
         cv2.waitKey(1)
 
+    def scan_callback(self, msg):
+        try:
+            if not self.lidar_initialized:
+                self.get_logger().info(f"LiDAR Configuration:\n"
+                                      f"Range: [{msg.range_min:.2f}m, {msg.range_max:.2f}m]\n"
+                                      f"Angles: [{np.rad2deg(msg.angle_min):.1f}° to "
+                                      f"{np.rad2deg(msg.angle_max):.1f}°]\n"
+                                      f"Resolution: {np.rad2deg(msg.angle_increment):.2f}°")
+                self.lidar_initialized = True
+
+            angle_increment = msg.angle_increment
+            start_angle = -np.deg2rad(15)
+            end_angle = np.deg2rad(15)
+            
+            start_idx = int((start_angle - msg.angle_min) / angle_increment)
+            end_idx = int((end_angle - msg.angle_min) / angle_increment)
+            
+            if start_idx < 0:
+                start_idx += len(msg.ranges)
+            if end_idx < 0:
+                end_idx += len(msg.ranges)
+
+            if start_idx < end_idx:
+                readings = msg.ranges[start_idx:end_idx]
+            else:
+                readings = msg.ranges[start_idx:] + msg.ranges[:end_idx]
+
+            valid_readings = [r for r in readings 
+                            if (msg.range_min < r < msg.range_max) 
+                            and not np.isnan(r)]
+            
+            if valid_readings:
+                self.current_distance = min(valid_readings)
+                self.get_logger().debug(f"New LiDAR distance: {self.current_distance:.2f}m")
+            else:
+                self.current_distance = float('inf')
+                
+        except Exception as e:
+            self.get_logger().error(f"LiDAR processing error: {str(e)}")
+
     def control_blue_approach(self):
-        """
-        If the blue box is not centered, rotate to center it.
-        Once centered, use a proportional controller based on the area error to drive forward.
-        """
         cmd = Twist()
-        if not self.blue_detected or self.avg_area == 0 or self.cx is None or self.frame_width is None:
-            self.get_logger().info("No blue detected during approach")
+        if not self.blue_detected or self.cx is None:
+            self.get_logger().info("No blue detected")
             return
 
         center_x = self.frame_width / 2.0
         error_x = self.cx - center_x
+        angular_z = -self.Kp_angle * error_x
 
-        # If blue box is not centered, command an angular correction.
-        if abs(error_x) > self.center_threshold:
-            cmd.angular.z = -self.Kp_angle * error_x
-            self.get_logger().info(f"Rotating: error_x = {error_x:.2f}, angular velocity = {cmd.angular.z:.2f}")
+        if self.current_distance <= self.min_safe_distance:
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.get_logger().warn(f"EMERGENCY STOP! Distance: {self.current_distance:.2f}m")
+        elif abs(error_x) > self.center_threshold:
+            cmd.angular.z = angular_z
+            self.get_logger().info(f"Centering: X error {error_x:.1f}px, Angular Z: {cmd.angular.z:.2f}")
         else:
-            # Blue box is centered; now use area error to drive forward.
-            if self.avg_area < self.target_area:
-                error_area = self.target_area - self.avg_area
-                vel = self.Kp * error_area
-                if vel > 0.25:
-                    vel = 0.25  # cap the velocity
-                cmd.linear.x = vel
-                self.get_logger().info(f"Moving forward: area error = {error_area:.2f}, velocity = {cmd.linear.x:.2f}")
+            distance_error = self.current_distance - self.target_distance
+            if distance_error > self.distance_tolerance:
+                cmd.linear.x = min(self.Kp_linear * distance_error, self.max_linear_speed)
+                self.get_logger().info(f"Approaching: {self.current_distance:.2f}m, Speed: {cmd.linear.x:.2f}m/s")
             else:
                 cmd.linear.x = 0.0
-                self.get_logger().info(f"Target reached (avg_area = {self.avg_area:.2f}), stopping")
+                self.get_logger().info("Reached target distance!")
+
         self.publisher.publish(cmd)
 
     def search_blue(self):
         cmd = Twist()
         cmd.angular.z = 0.4
-        self.get_logger().info("Searching for blue")
         self.publisher.publish(cmd)
+        self.get_logger().info("Searching for blue box...")
 
 def main():
     rclpy.init()
-    # Create nodes
     robot = Robot()
-    navigator = robot.navigator  # Access the navigator node
+    navigator = robot.navigator
 
-    # Create a MultiThreadedExecutor and add both nodes so that all callbacks are handled
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(robot)
     executor.add_node(navigator)
 
-    # Signal handler for graceful shutdown
     def signal_handler(sig, frame):
         robot.get_logger().info("Shutting down")
         rclpy.shutdown()
-    signal.signal(signal.SIGINT, signal_handler)
 
-    # Start executor in a separate thread
+    signal.signal(signal.SIGINT, signal_handler)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
     try:
-        # Phase 1: Navigate through waypoints until a blue object is detected.
+        # Phase 1: Waypoint navigation
         while robot.current_waypoint < len(robot.waypoints) and rclpy.ok():
             x, y, yaw = robot.waypoints[robot.current_waypoint]
             navigator.send_goal(x, y, yaw)
             
-            # Wait until either the navigation goal is completed or blue is detected.
             while not navigator.goal_completed and not robot.blue_detected and rclpy.ok():
                 time.sleep(0.1)
             
@@ -214,46 +218,49 @@ def main():
             else:
                 robot.current_waypoint += 1
 
-        # Phase 2: Approach the blue box using centering and proportional control.
+        # Phase 2: Box approach
         if robot.blue_detected:
-            robot.get_logger().info("Approaching blue box")
+            robot.get_logger().info("Starting approach procedure")
+            last_distance = None
+            stable_count = 0
+            
             while rclpy.ok():
-                # If blue is lost during approach, switch to search mode.
                 if not robot.blue_detected:
-                    robot.get_logger().info("Lost blue target, searching...")
                     robot.search_blue()
-                # Check if the area error is within tolerance.
-                if abs(robot.target_area - robot.avg_area) < robot.tolerance:
-                    robot.get_logger().info("Reached desired distance from blue box.")
+                    time.sleep(0.1)
+                    continue
+                
+                # Check for stable distance reading
+                if last_distance is not None:
+                    if abs(robot.current_distance - last_distance) < 0.01:
+                        stable_count += 1
+                    else:
+                        stable_count = 0
+                
+                if stable_count > 5:
+                    robot.get_logger().info("Stable distance achieved")
                     break
+                
+                if abs(robot.current_distance - robot.target_distance) <= robot.distance_tolerance:
+                    robot.get_logger().info("Successfully reached target distance")
+                    break
+                
                 robot.control_blue_approach()
+                last_distance = robot.current_distance
                 time.sleep(0.1)
         else:
-            robot.get_logger().info("Searching for blue box")
+            robot.get_logger().info("Initiating search pattern")
             while not robot.blue_detected and rclpy.ok():
                 robot.search_blue()
                 time.sleep(0.1)
-            if robot.blue_detected:
-                robot.get_logger().info("Blue found - approaching")
-                while rclpy.ok():
-                    if abs(robot.target_area - robot.avg_area) < robot.tolerance:
-                        robot.get_logger().info("Reached desired distance from blue box.")
-                        break
-                    if robot.blue_detected:
-                        robot.control_blue_approach()
-                    else:
-                        robot.get_logger().info("Lost blue target, searching...")
-                        robot.search_blue()
-                    time.sleep(0.1)
 
-        # Final stop command
+        # Final stop
         robot.publisher.publish(Twist())
         robot.get_logger().info("Mission complete")
 
     except Exception as e:
-        robot.get_logger().error(f"Error: {str(e)}")
+        robot.get_logger().error(f"Critical error: {str(e)}")
     finally:
-        # Do not close the camera window so it remains open.
         executor.shutdown()
         robot.destroy_node()
         navigator.destroy_node()
