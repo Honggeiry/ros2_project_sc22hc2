@@ -62,7 +62,11 @@ class Robot(Node):
         self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.subscription_scan = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         
-        self.waypoints = [(-6.17, -4.06, -0.00134)]
+        self.waypoints = [
+            (-2.97, -3.9, -0.00134),
+            (6.9, -5.13, -0.00134),
+            (7.27, -11.4, -0.00134),
+            (-6.22, -12.4, -0.00134)]
         self.current_waypoint = 0
         self.navigator = GoToPose()
 
@@ -72,11 +76,11 @@ class Robot(Node):
 
         # LiDAR parameters
         self.current_distance = float('inf')
-        self.target_distance = 1.0
-        self.distance_tolerance = 0.1
+        self.target_distance = 0.8
+        self.distance_tolerance = 0.15
         self.Kp_linear = 0.3
         self.max_linear_speed = 0.2
-        self.min_safe_distance = 0.8
+        self.min_safe_distance = 0.7
         self.lidar_initialized = False
 
         # Centering parameters
@@ -114,11 +118,6 @@ class Robot(Node):
     def scan_callback(self, msg):
         try:
             if not self.lidar_initialized:
-                self.get_logger().info(f"LiDAR Configuration:\n"
-                                      f"Range: [{msg.range_min:.2f}m, {msg.range_max:.2f}m]\n"
-                                      f"Angles: [{np.rad2deg(msg.angle_min):.1f}° to "
-                                      f"{np.rad2deg(msg.angle_max):.1f}°]\n"
-                                      f"Resolution: {np.rad2deg(msg.angle_increment):.2f}°")
                 self.lidar_initialized = True
 
             angle_increment = msg.angle_increment
