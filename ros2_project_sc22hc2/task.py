@@ -95,10 +95,12 @@ class Robot(Node):
             return
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Blue detection for control
         lower_blue = np.array([100, 150, 50])
         upper_blue = np.array([140, 255, 255])
-        mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+        contours, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         self.frame_width = frame.shape[1]
         self.blue_detected = False
@@ -112,7 +114,29 @@ class Robot(Node):
                 if M["m00"] != 0:
                     self.cx = int(M["m10"] / M["m00"])
 
-        cv2.imshow('Camera View', frame)
+        # Colour filtering
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([160, 100, 100])
+        upper_red2 = np.array([180, 255, 255])
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+
+        # Green mask
+        lower_green = np.array([40, 70, 70])
+        upper_green = np.array([80, 255, 255])
+        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+        # Combine masks: blue, red, and green
+        combined_mask = cv2.bitwise_or(mask_blue, mask_red)
+        combined_mask = cv2.bitwise_or(combined_mask, mask_green)
+
+        # Apply the combined mask to show only the filtered colours
+        filtered_image = cv2.bitwise_and(frame, frame, mask=combined_mask)
+
+        # Display the filtered image
+        cv2.imshow('Filtered Colours', filtered_image)
         cv2.waitKey(1)
 
     def scan_callback(self, msg):
@@ -138,8 +162,8 @@ class Robot(Node):
                 readings = msg.ranges[start_idx:] + msg.ranges[:end_idx]
 
             valid_readings = [r for r in readings 
-                            if (msg.range_min < r < msg.range_max) 
-                            and not np.isnan(r)]
+                              if (msg.range_min < r < msg.range_max) 
+                              and not np.isnan(r)]
             
             if valid_readings:
                 self.current_distance = min(valid_readings)
